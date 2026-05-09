@@ -16,7 +16,12 @@ from styles import inject_css
 from data_engine import fetch_ohlcv, fetch_vix, fetch_quote
 from indicators import resonance_score, ema, rsi, macd, volume_avg, volume_cascade_check
 from volume_cascade import run_cascade, get_cascade_state, get_cascade_log
-from telegram_bot import send_alert, send_volume_cascade
+from telegram_bot import (
+    send_alert, send_volume_cascade,
+    send_resonance_high, send_resonance_drop,
+    send_macd_cross, send_ema_alignment,
+    send_vix_spike, send_multi_resonance,
+)
 from groq_engine import groq_analysis
 
 # ─── Page Config ─────────────────────────────────────────────────────────────
@@ -43,14 +48,17 @@ C = {
 # ─── Session State Init ───────────────────────────────────────────────────────
 def init_state():
     defaults = {
-        "tickers":         ["TSLA", "NVDA", "AAPL", "SPY", "QQQ"],
-        "selected":        "TSLA",
-        "tg_global_mute":  False,
-        "tg_sent_keys":    set(),
-        "global_alerts":   [],
-        "last_refresh":    0,
+        "tickers":          ["TSLA", "NVDA", "AAPL", "SPY", "QQQ"],
+        "selected":         "TSLA",
+        "tg_global_mute":   False,
+        "global_alerts":    [],
+        "last_refresh":     0,
         "refresh_interval": 30,
-        "vc_threshold":    1.0,
+        "vc_threshold":     1.0,
+        "tg_cooldown_min":  30,       # Telegram冷卻時間（分鐘）
+        # 信號狀態機 — 記錄上次各指標狀態，只在邊界跨越時發送
+        "sig_prev": {},   # { ticker: { "score_zone", "macd_sign", "ema_align", "vix_spike" } }
+        "vix_prev": 0.0,  # 上次VIX值，用於計算單日漲幅
     }
     for k, v in defaults.items():
         if k not in st.session_state:
@@ -125,6 +133,17 @@ with st.sidebar:
     else:
         st.markdown('<span style="font-family:IBM Plex Mono;font-size:9px;color:#6fcf97">● 通知開啟</span>', unsafe_allow_html=True)
 
+    # 冷卻時間設定
+    cooldown = st.slider("冷卻時間 (分鐘)", 5, 120,
+                         st.session_state.tg_cooldown_min, 5,
+                         label_visibility="collapsed")
+    st.session_state.tg_cooldown_min = cooldown
+    st.markdown(
+        f'<span style="font-family:IBM Plex Mono;font-size:9px;color:#555">'
+        f'每{cooldown}分鐘最多發1次</span>',
+        unsafe_allow_html=True
+    )
+
     st.markdown("---")
 
     # 手動刷新
@@ -198,6 +217,108 @@ def load_all_data(tickers):
 
 with st.spinner(""):
     all_data = load_all_data(tuple(st.session_state.tickers))
+
+
+# ─── 信號狀態機 & Telegram觸發 ───────────────────────────────────────────────
+def _score_zone(score: int) -> str:
+    """共振分數分區：high / mid / low"""
+    return "high" if score >= 70 else "mid" if score >= 50 else "low"
+
+def _ema_align(m: dict) -> str:
+    """EMA排列狀態"""
+    e8, e21, e55 = m.get("ema8", 0), m.get("ema21", 0), m.get("ema55", 0)
+    if e8 > e21 > e55:  return "bull"
+    if e8 < e21 < e55:  return "bear"
+    return "mixed"
+
+def _macd_sign(m: dict) -> str:
+    return "pos" if m.get("macd", 0) >= 0 else "neg"
+
+def run_signal_checks(all_data: dict, stock_metrics: dict, vix_now: float):
+    """
+    對每隻股票執行信號狀態機檢查
+    只在狀態跨越邊界時發送Telegram
+    """
+    prev_map  = st.session_state.sig_prev       # 上次狀態快照
+    vix_prev  = st.session_state.vix_prev or vix_now
+    resonance_triggered = []                     # 記錄本輪共振≥70的ticker
+
+    for ticker in st.session_state.tickers:
+        m     = stock_metrics.get(ticker, {})
+        quote = all_data.get(ticker, {}).get("quote", {})
+        price = m.get("price", quote.get("price", 0))
+        score = m.get("score", 50)
+        ai    = {}  # entry/stop/target留給groq，此處用規則估算
+        entry  = round(price * 0.993, 2)
+        stop   = round(price * 0.975, 2)
+        target = round(price * 1.035, 2)
+
+        prev  = prev_map.get(ticker, {})
+        cur   = {
+            "score_zone": _score_zone(score),
+            "macd_sign":  _macd_sign(m),
+            "ema_align":  _ema_align(m),
+        }
+
+        # ── 1. 共振分數 ── ─────────────────────────────────────────────────
+        if cur["score_zone"] == "high":
+            resonance_triggered.append(ticker)
+            if prev.get("score_zone") != "high":
+                sent = send_resonance_high(ticker, score, price, entry, stop, target)
+                if sent:
+                    add_global_alert(ticker, "info",
+                        f"📗 共振突破70 ({score}/100) — Entry訊號")
+
+        elif cur["score_zone"] == "low" and prev.get("score_zone") in ("high", "mid"):
+            sent = send_resonance_drop(ticker, score, price)
+            if sent:
+                add_global_alert(ticker, "warn",
+                    f"🔔 共振跌破50 ({score}/100) — 結構轉弱")
+
+        # ── 2. MACD金叉 / 死叉 ────────────────────────────────────────────
+        prev_sign = prev.get("macd_sign")
+        if prev_sign and prev_sign != cur["macd_sign"]:
+            is_golden = cur["macd_sign"] == "pos"
+            sent = send_macd_cross(ticker, is_golden, price, m.get("macd", 0))
+            if sent:
+                label = "金叉 ▲" if is_golden else "死叉 ▼"
+                add_global_alert(ticker, "info" if is_golden else "warn",
+                    f"{'📗' if is_golden else '🔔'} MACD {label}")
+
+        # ── 3. EMA排列形成 ────────────────────────────────────────────────
+        prev_align = prev.get("ema_align")
+        if prev_align and prev_align != cur["ema_align"] and cur["ema_align"] != "mixed":
+            is_bull = cur["ema_align"] == "bull"
+            sent = send_ema_alignment(ticker, is_bull, price)
+            if sent:
+                label = "多頭排列 ▲" if is_bull else "空頭排列 ▼"
+                add_global_alert(ticker, "info" if is_bull else "warn",
+                    f"{'📗' if is_bull else '🔔'} EMA {label}")
+
+        # 更新快照
+        prev_map[ticker] = cur
+
+    # ── 4. VIX急升 (單日 > 15%) ───────────────────────────────────────────
+    if vix_prev > 0:
+        vix_chg_pct = (vix_now - vix_prev) / vix_prev * 100
+        if vix_chg_pct >= 15:
+            sent = send_vix_spike(vix_now, vix_prev, vix_chg_pct)
+            if sent:
+                add_global_alert("VIX", "danger",
+                    f"🚨 VIX急升 {vix_chg_pct:.1f}% → {vix_now:.1f}")
+
+    # ── 5. 多股共振 (3+隻同時≥70) — 升級DANGER ───────────────────────────
+    if len(resonance_triggered) >= 3:
+        price_map = {t: stock_metrics.get(t, {}).get("price", 0)
+                     for t in resonance_triggered}
+        sent = send_multi_resonance(resonance_triggered, price_map)
+        if sent:
+            add_global_alert("MARKET", "danger",
+                f"🚨 {len(resonance_triggered)}隻共振 — {', '.join(resonance_triggered)}")
+
+    # 儲存狀態
+    st.session_state.sig_prev = prev_map
+    st.session_state.vix_prev = vix_now
 
 
 # ─── 股票卡片網格 ─────────────────────────────────────────────────────────────
@@ -352,6 +473,9 @@ for i, ticker in enumerate(st.session_state.tickers):
             st.session_state.selected = ticker
             st.rerun()
 
+
+# ── 所有stock_metrics計算完畢後，執行信號狀態機 ──────────────────────────────
+run_signal_checks(all_data, stock_metrics, vix)
 
 st.markdown('<hr style="border-color:#1e1e1e;margin:12px 0"/>', unsafe_allow_html=True)
 
