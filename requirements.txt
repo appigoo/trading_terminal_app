@@ -1,0 +1,8 @@
+streamlit>=1.37.0
+yfinance>=0.2.38
+pandas>=2.0.0
+numpy>=1.24.0
+plotly>=5.18.0
+requests>=2.31.0
+curl_cffi>=0.6.0
+groq>=0.9.0
