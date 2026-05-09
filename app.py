@@ -445,14 +445,19 @@ with main_left:
             x=df.index, open=df["Open"], high=df["High"],
             low=df["Low"], close=df["Close"],
             increasing_line_color=C["bull"], decreasing_line_color=C["bear"],
-            increasing_fillcolor=C["bull"] + "88", decreasing_fillcolor=C["bear"] + "88",
+            increasing_fillcolor="rgba(111,207,151,0.55)",
+            decreasing_fillcolor="rgba(235,87,87,0.55)",
             name="K線", showlegend=False,
         ))
 
         # EMA（僅日線）
         if len(df) >= 55:
             close = df["Close"]
-            for period, color, name in [(8, "#6fcf97aa", "EMA8"), (21, "#f2c94caa", "EMA21"), (55, "#56b4e9aa", "EMA55")]:
+            for period, color, name in [
+                (8,  "rgba(111,207,151,0.7)", "EMA8"),
+                (21, "rgba(242,201,76,0.7)",  "EMA21"),
+                (55, "rgba(86,180,233,0.7)",  "EMA55"),
+            ]:
                 e = close.ewm(span=period, adjust=False).mean()
                 fig.add_trace(go.Scatter(x=df.index, y=e, line=dict(color=color, width=1),
                                           name=name, showlegend=True))
@@ -470,7 +475,7 @@ with main_left:
             avg5 = df["Volume"].rolling(5).mean()
             fig.add_trace(go.Scatter(
                 x=df.index, y=avg5,
-                line=dict(color=C["warn"] + "99", width=1, dash="dot"),
+                line=dict(color="rgba(242,201,76,0.6)", width=1, dash="dot"),
                 name="Vol Avg5", yaxis="y2", showlegend=True,
             ))
 
