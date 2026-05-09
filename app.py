@@ -4,9 +4,11 @@ app.py — Trading Terminal
 視覺先於文字 — 顏色/動畫/大小即意思
 """
 import streamlit as st
+import streamlit.components.v1 as components
 import pandas as pd
 import numpy as np
 import plotly.graph_objects as go
+import json
 import time
 from datetime import datetime
 
@@ -352,6 +354,356 @@ for i, ticker in enumerate(st.session_state.tickers):
 
 
 st.markdown('<hr style="border-color:#1e1e1e;margin:12px 0"/>', unsafe_allow_html=True)
+
+
+# ─── Force Graph 訊號網絡圖 ───────────────────────────────────────────────────
+def build_force_graph_html(stock_metrics: dict, vix: float, tickers: list) -> str:
+    """
+    生成完整的Force Graph HTML字符串
+    節點由stocks實時數據驅動：
+      TICKER節點  → 大小=共振分數，顏色=多/空/中性
+      INDICATOR節點 → RSI超買超賣、MACD方向、量能異動
+      CATALYST節點  → VIX狀態
+      CLUSTER節點   → 3+股票同向聚合
+      COLLISION節點 → 多空訊號衝突
+    """
+    # 序列化stocks數據給JS使用
+    stocks_js = {}
+    for t in tickers:
+        m = stock_metrics.get(t, {})
+        stocks_js[t] = {
+            "score":    m.get("score", 50),
+            "rsi":      m.get("rsi", 50),
+            "macd":     m.get("macd", 0),
+            "ratio5m":  m.get("ratio_5m", 0) or 0,
+            "ratio15m": m.get("ratio_15m", 0) or 0,
+            "state":    m.get("state", "normal"),
+            "price":    m.get("price", 0),
+            "change1d": m.get("change1d", 0),
+        }
+
+    stocks_json = json.dumps(stocks_js)
+    tickers_json = json.dumps(tickers)
+    vix_val = float(vix)
+
+    html = f"""
+<div style="background:#080808;border:1px solid #1e1e1e;border-radius:8px;overflow:hidden;margin-bottom:4px">
+  <div style="padding:8px 14px 0;display:flex;align-items:center;gap:10px">
+    <span style="font-family:'IBM Plex Mono',monospace;font-size:9px;color:#555;letter-spacing:0.12em">SIGNAL NETWORK</span>
+    <span style="font-family:'IBM Plex Mono',monospace;font-size:8px;color:#333">節點由實時訊號驅動 · 大小=共振強度 · 顏色=方向</span>
+  </div>
+  <canvas id="fgCanvas" style="display:block;width:100%;height:260px;cursor:crosshair"></canvas>
+  <div id="fgTooltip" style="display:none;position:absolute;background:rgba(8,8,8,0.95);border:1px solid #2a2a2a;border-radius:5px;padding:7px 10px;font-family:'IBM Plex Mono',monospace;pointer-events:none;z-index:999"></div>
+</div>
+
+<script>
+(function() {{
+  const STOCKS = {stocks_json};
+  const TICKERS = {tickers_json};
+  const VIX = {vix_val};
+
+  const C = {{
+    bull: '#6fcf97', bear: '#eb5757', warn: '#f2c94c',
+    info: '#56b4e9', purple: '#bb86fc', pink: '#ff79c6',
+  }};
+
+  function clamp(v,lo,hi){{ return Math.max(lo,Math.min(hi,v)); }}
+  function rand(a,b){{ return a+Math.random()*(b-a); }}
+  function scoreColor(s){{ return s>=65?C.bull:s>=50?C.warn:C.bear; }}
+
+  // ── 建構節點和邊 ──────────────────────────────────────────────────────────
+  const nodes=[], edges=[];
+  let nid=0;
+  const tickerIds={{}};
+
+  // Ticker主節點
+  TICKERS.forEach(t => {{
+    const d = STOCKS[t]||{{}};
+    const sc = d.score||50;
+    const color = scoreColor(sc);
+    const id = nid++;
+    tickerIds[t] = id;
+    nodes.push({{
+      id, label:t, type:'TICKER',
+      color, size: 8+(sc/100)*10,
+      glow: sc>=65||sc<40,
+      sub: '$'+(d.price||0).toFixed(0),
+      pulse: rand(0,Math.PI*2), vx:0, vy:0, x:0, y:0,
+    }});
+  }});
+
+  // Indicator節點
+  TICKERS.forEach(t => {{
+    const d = STOCKS[t]||{{}};
+    const tid = tickerIds[t];
+    if(d.rsi>70||d.rsi<30){{
+      const id=nid++;
+      nodes.push({{id,label:d.rsi>70?'RSI↑':'RSI↓',type:'INDICATOR',
+        color:d.rsi<30?C.bull:C.bear,size:5,glow:false,
+        pulse:rand(0,Math.PI*2),vx:0,vy:0,x:0,y:0}});
+      edges.push({{a:tid,b:id,strength:0.8,dashed:false}});
+    }}
+    if(Math.abs(d.macd||0)>0.5){{
+      const id=nid++;
+      nodes.push({{id,label:(d.macd||0)>0?'MACD+':'MACD−',type:'INDICATOR',
+        color:(d.macd||0)>0?C.bull:C.bear,size:5,glow:false,
+        pulse:rand(0,Math.PI*2),vx:0,vy:0,x:0,y:0}});
+      edges.push({{a:tid,b:id,strength:0.7,dashed:false}});
+    }}
+    if((d.ratio5m||0)>=(1.0)){{
+      const id=nid++;
+      const isMajor=(d.ratio15m||0)>=1.0;
+      nodes.push({{id,label:isMajor?'VOL🚨':'VOL↑',type:'INDICATOR',
+        color:isMajor?C.bear:C.info,size:isMajor?8:5,glow:isMajor,
+        pulse:rand(0,Math.PI*2),vx:0,vy:0,x:0,y:0}});
+      edges.push({{a:tid,b:id,strength:isMajor?1.0:0.6,dashed:!isMajor}});
+    }}
+  }});
+
+  // VIX Catalyst
+  const vixColor = VIX>25?C.bear:VIX>18?C.warn:C.bull;
+  const vixId=nid++;
+  nodes.push({{id:vixId,label:'VIX '+(VIX).toFixed(1),type:'CATALYST',
+    color:vixColor,size:13,glow:VIX>22,
+    pulse:0,vx:0,vy:0,x:0,y:0}});
+  TICKERS.forEach(t=>edges.push({{a:vixId,b:tickerIds[t],strength:0.25,dashed:true}}));
+
+  // Cluster
+  const bulls=TICKERS.filter(t=>(STOCKS[t]?.score||50)>=65);
+  const bears=TICKERS.filter(t=>(STOCKS[t]?.score||50)<40);
+  if(bulls.length>=2){{
+    const id=nid++;
+    nodes.push({{id,label:'BULL CLUSTER',type:'CLUSTER',
+      color:C.bull,size:16,glow:true,pulse:0,vx:0,vy:0,x:0,y:0}});
+    bulls.forEach(t=>edges.push({{a:id,b:tickerIds[t],strength:0.9,dashed:false}}));
+  }}
+  if(bears.length>=2){{
+    const id=nid++;
+    nodes.push({{id,label:'BEAR CLUSTER',type:'CLUSTER',
+      color:C.bear,size:16,glow:true,pulse:0,vx:0,vy:0,x:0,y:0}});
+    bears.forEach(t=>edges.push({{a:id,b:tickerIds[t],strength:0.9,dashed:false}}));
+  }}
+
+  // Collision
+  if(bulls.length>=1&&bears.length>=1){{
+    const id=nid++;
+    nodes.push({{id,label:'COLLISION',type:'COLLISION',
+      color:C.pink,size:7,glow:false,pulse:rand(0,Math.PI*2),vx:0,vy:0,x:0,y:0}});
+    edges.push({{a:id,b:tickerIds[bulls[0]],strength:0.5,dashed:true}});
+    edges.push({{a:id,b:tickerIds[bears[0]],strength:0.5,dashed:true}});
+  }}
+
+  // 整體市場方向
+  const scores=TICKERS.map(t=>(STOCKS[t]?.score||50));
+  const avgSc=scores.reduce((a,b)=>a+b,0)/scores.length;
+  const mktColor=avgSc>=65?C.bull:avgSc<40?C.bear:C.warn;
+  const mktLabel=avgSc>=65?'STRONG UP':avgSc<40?'STRONG DOWN':'NEUTRAL';
+  const mktId=nid++;
+  nodes.push({{id:mktId,label:mktLabel,type:'CATALYST',
+    color:mktColor,size:11,glow:true,pulse:0,vx:0,vy:0,x:0,y:0}});
+  edges.push({{a:mktId,b:vixId,strength:0.35,dashed:true}});
+
+  // ── Canvas 設定 ──────────────────────────────────────────────────────────
+  const canvas = document.getElementById('fgCanvas');
+  const tip    = document.getElementById('fgTooltip');
+  let W=canvas.offsetWidth, H=260;
+  canvas.width=W; canvas.height=H;
+  const ctx = canvas.getContext('2d');
+
+  // 初始位置：圓形排列
+  nodes.forEach((n,i)=>{{
+    const ang=(i/nodes.length)*Math.PI*2;
+    const r=Math.min(W,H)*0.3;
+    n.x=W/2+r*Math.cos(ang)+rand(-15,15);
+    n.y=H/2+r*Math.sin(ang)+rand(-15,15);
+  }});
+
+  // ── Physics ───────────────────────────────────────────────────────────────
+  function applyForces(){{
+    const CX=W/2,CY=H/2;
+    const REPEL=1400,SPRING=0.016,REST=90,DAMP=0.82,CENTER=0.005;
+    nodes.forEach(n=>{{
+      n.vx=(n.vx||0)*DAMP;
+      n.vy=(n.vy||0)*DAMP;
+      n.vx+=(CX-n.x)*CENTER;
+      n.vy+=(CY-n.y)*CENTER;
+      n.pulse=(n.pulse||0)+0.03;
+    }});
+    for(let i=0;i<nodes.length;i++){{
+      for(let j=i+1;j<nodes.length;j++){{
+        const dx=nodes[j].x-nodes[i].x, dy=nodes[j].y-nodes[i].y;
+        const d=Math.sqrt(dx*dx+dy*dy)||1;
+        const f=REPEL/(d*d);
+        const fx=(dx/d)*f, fy=(dy/d)*f;
+        nodes[i].vx-=fx; nodes[i].vy-=fy;
+        nodes[j].vx+=fx; nodes[j].vy+=fy;
+      }}
+    }}
+    edges.forEach(e=>{{
+      const a=nodes[e.a],b=nodes[e.b];
+      if(!a||!b)return;
+      const dx=b.x-a.x,dy=b.y-a.y;
+      const d=Math.sqrt(dx*dx+dy*dy)||1;
+      const f=(d-REST)*SPRING*(e.strength||0.5);
+      const fx=(dx/d)*f,fy=(dy/d)*f;
+      a.vx+=fx;a.vy+=fy;b.vx-=fx;b.vy-=fy;
+    }});
+    nodes.forEach(n=>{{
+      n.x=clamp(n.x+n.vx,n.size+4,W-n.size-4);
+      n.y=clamp(n.y+n.vy,n.size+4,H-n.size-20);
+    }});
+  }}
+
+  // ── Draw ─────────────────────────────────────────────────────────────────
+  function draw(){{
+    ctx.clearRect(0,0,W,H);
+
+    // 背景格線
+    ctx.strokeStyle='#111'; ctx.lineWidth=0.5;
+    for(let x=0;x<W;x+=44){{ctx.beginPath();ctx.moveTo(x,0);ctx.lineTo(x,H);ctx.stroke();}}
+    for(let y=0;y<H;y+=44){{ctx.beginPath();ctx.moveTo(0,y);ctx.lineTo(W,y);ctx.stroke();}}
+
+    // 邊
+    edges.forEach(e=>{{
+      const a=nodes[e.a],b=nodes[e.b];
+      if(!a||!b)return;
+      ctx.save();
+      if(e.dashed)ctx.setLineDash([3,6]);
+      ctx.lineWidth=0.6+(e.strength||0.5)*0.9;
+      const sameColor=a.color===b.color;
+      ctx.strokeStyle=sameColor
+        ? a.color+'28'
+        : 'rgba(180,180,180,0.10)';
+      ctx.beginPath();ctx.moveTo(a.x,a.y);ctx.lineTo(b.x,b.y);ctx.stroke();
+      ctx.restore();
+    }});
+
+    // 節點
+    nodes.forEach(n=>{{
+      const r=n.size+Math.sin(n.pulse)*1.8;
+
+      // 光暈
+      if(n.glow){{
+        const g=ctx.createRadialGradient(n.x,n.y,r*0.4,n.x,n.y,r*2.8);
+        g.addColorStop(0,n.color+'30');g.addColorStop(1,'transparent');
+        ctx.beginPath();ctx.arc(n.x,n.y,r*2.8,0,Math.PI*2);
+        ctx.fillStyle=g;ctx.fill();
+      }}
+
+      // 主圓
+      ctx.beginPath();ctx.arc(n.x,n.y,r,0,Math.PI*2);
+      ctx.fillStyle=n.color;
+      ctx.shadowColor=n.color;ctx.shadowBlur=n.glow?14:5;
+      ctx.fill();ctx.shadowBlur=0;
+
+      // 高光
+      ctx.beginPath();ctx.arc(n.x-r*0.28,n.y-r*0.28,r*0.32,0,Math.PI*2);
+      ctx.fillStyle='rgba(255,255,255,0.15)';ctx.fill();
+
+      // 標籤
+      const big=n.type==='CLUSTER'||n.type==='CATALYST';
+      ctx.font=(big?'700 9px':'400 8px')+' "IBM Plex Mono",monospace';
+      ctx.fillStyle=n.type==='TICKER'?'#e8e4dc':n.color+'dd';
+      ctx.textAlign='center';
+      ctx.fillText(n.label,n.x,n.y+r+11);
+      if(n.type==='TICKER'&&n.sub){{
+        ctx.font='400 7px "IBM Plex Mono",monospace';
+        ctx.fillStyle='#555';
+        ctx.fillText(n.sub,n.x,n.y+r+20);
+      }}
+    }});
+
+    // 右上角stats
+    const statsX=W-12, statsY=12;
+    const lines=[
+      ['CONVERGENCE', (Math.abs(avgSc-50)*2).toFixed(0)+'%', mktColor],
+      ['BULL NODES',  bulls.length+'', C.bull],
+      ['BEAR NODES',  bears.length+'', C.bear],
+      ['SIGNAL',      mktLabel,        mktColor],
+    ];
+    ctx.fillStyle='rgba(8,8,8,0.85)';
+    ctx.beginPath();ctx.roundRect(statsX-130,statsY,130,lines.length*16+12,4);ctx.fill();
+    lines.forEach((l,i)=>{{
+      ctx.font='400 8px "IBM Plex Mono",monospace';
+      ctx.fillStyle='#444';ctx.textAlign='left';
+      ctx.fillText(l[0],statsX-126,statsY+10+i*16);
+      ctx.fillStyle=l[2];ctx.textAlign='right';
+      ctx.fillText(l[1],statsX-4,statsY+10+i*16);
+    }});
+
+    // 左上角圖例
+    const leg=[
+      [C.bull,'BULL'],
+      [C.bear,'BEAR'],
+      [C.warn,'NEUTRAL'],
+      [C.info,'VOL SPIKE'],
+      ['#bb86fc','CLUSTER'],
+      [C.pink,'COLLISION'],
+    ];
+    ctx.fillStyle='rgba(8,8,8,0.85)';
+    ctx.beginPath();ctx.roundRect(8,8,108,leg.length*14+10,4);ctx.fill();
+    leg.forEach((l,i)=>{{
+      ctx.beginPath();ctx.arc(18,16+i*14,4,0,Math.PI*2);
+      ctx.fillStyle=l[0];ctx.fill();
+      ctx.font='400 8px "IBM Plex Mono",monospace';
+      ctx.fillStyle='#666';ctx.textAlign='left';
+      ctx.fillText(l[1],26,19+i*14);
+    }});
+
+    // 底部信號badge
+    ctx.font='700 10px "IBM Plex Mono",monospace';
+    ctx.fillStyle=mktColor+'18';
+    const bw=110,bh=18,bx=(W-bw)/2,by=H-26;
+    ctx.beginPath();ctx.roundRect(bx,by,bw,bh,4);ctx.fill();
+    ctx.strokeStyle=mktColor+'44';ctx.lineWidth=1;
+    ctx.beginPath();ctx.roundRect(bx,by,bw,bh,4);ctx.stroke();
+    ctx.fillStyle=mktColor;ctx.textAlign='center';
+    ctx.fillText(mktLabel,W/2,by+13);
+  }}
+
+  // ── Loop ─────────────────────────────────────────────────────────────────
+  function loop(){{
+    applyForces();draw();
+    requestAnimationFrame(loop);
+  }}
+  requestAnimationFrame(loop);
+
+  // ── Tooltip ───────────────────────────────────────────────────────────────
+  canvas.addEventListener('mousemove',e=>{{
+    const rect=canvas.getBoundingClientRect();
+    const mx=(e.clientX-rect.left)*(canvas.width/rect.width);
+    const my=(e.clientY-rect.top)*(canvas.height/rect.height);
+    let hit=null;
+    for(const n of nodes){{
+      const dx=n.x-mx,dy=n.y-my;
+      if(Math.sqrt(dx*dx+dy*dy)<n.size+8){{hit=n;break;}}
+    }}
+    if(hit){{
+      tip.style.display='block';
+      tip.style.left=(e.clientX+12)+'px';
+      tip.style.top=(e.clientY-10)+'px';
+      const d=STOCKS[hit.label]||{{}};
+      tip.innerHTML=
+        '<div style="color:'+hit.color+';font-weight:700;font-size:10px;margin-bottom:3px">'+hit.label+'</div>'+
+        '<div style="color:#888;font-size:9px">TYPE: '+hit.type+'</div>'+
+        (d.score!==undefined?'<div style="color:#888;font-size:9px">共振: '+d.score+'/100</div>':'')+
+        (d.price?'<div style="color:#888;font-size:9px">價格: $'+d.price.toFixed(2)+'</div>':'');
+    }}else{{
+      tip.style.display='none';
+    }}
+  }});
+  canvas.addEventListener('mouseleave',()=>{{ tip.style.display='none'; }});
+}})();
+</script>
+"""
+    return html
+
+
+# 渲染Force Graph
+fg_html = build_force_graph_html(stock_metrics, vix, st.session_state.tickers)
+components.html(fg_html, height=290, scrolling=False)
+
+st.markdown('<hr style="border-color:#1e1e1e;margin:8px 0 12px"/>', unsafe_allow_html=True)
 
 
 # ─── 主分析區 ─────────────────────────────────────────────────────────────────
