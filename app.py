@@ -48,7 +48,7 @@ C = {
 # ─── Session State Init ───────────────────────────────────────────────────────
 def init_state():
     defaults = {
-        "tickers":          ["TSLA", "NVDA", "AAPL", "SPY", "QQQ", "AMZN"],
+        "tickers":          ["TSLA", "NVDA", "AAPL", "SPY", "QQQ"],
         "selected":         "TSLA",
         "tg_global_mute":   False,
         "global_alerts":    [],
@@ -121,6 +121,12 @@ with st.sidebar:
                               label_visibility="collapsed")
     st.session_state.vc_threshold = vc_threshold
     st.markdown(f'<span style="font-family:IBM Plex Mono;font-size:9px;color:#555">{vc_threshold:.1f}× 前5根均量</span>', unsafe_allow_html=True)
+
+    watch_timeout = st.slider("監視超時 (分鐘)", 5, 60,
+                               st.session_state.get("vc_watch_timeout_min", 15), 5,
+                               label_visibility="collapsed")
+    st.session_state["vc_watch_timeout_min"] = watch_timeout
+    st.markdown(f'<span style="font-family:IBM Plex Mono;font-size:9px;color:#555">{watch_timeout}分鐘未確認自動重置</span>', unsafe_allow_html=True)
 
     st.markdown("---")
 
