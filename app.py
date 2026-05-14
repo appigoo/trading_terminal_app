@@ -48,7 +48,7 @@ C = {
 # ─── Session State Init ───────────────────────────────────────────────────────
 def init_state():
     defaults = {
-        "tickers":          ["TSLA", "NVDA", "AAPL", "SPY", "QQQ"],
+        "tickers":          ["TSLA", "NVDA", "AAPL", "SPY", "QQQ", "AMZN"],
         "selected":         "TSLA",
         "tg_global_mute":   False,
         "global_alerts":    [],
